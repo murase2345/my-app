@@ -1,0 +1,7 @@
+コマンド
+
+
+cd "C:\Users\muras\react-app\my-app"
+
+npm run dev
+
