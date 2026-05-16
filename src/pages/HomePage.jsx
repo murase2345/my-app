@@ -2,11 +2,9 @@ import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useLiveQuery } from "dexie-react-hooks";
 import Modal from "../components/Modal.jsx";
-import ConfirmDialog from "../components/ConfirmDialog.jsx";
-import { useToast } from "../components/Toast.jsx";
 import { useApp } from "../store/AppContext.jsx";
-import { db } from "../db/db.js";
-import { toDateKey, addDays } from "../utils/date.js";
+import { db, getStudyTimeMsByDate, toDateKey } from "../db/db.js";
+import { addDays } from "../utils/date.js";
 
 function startOfDayTs(dateKey) {
   return new Date(dateKey + "T00:00:00").getTime();
@@ -26,7 +24,6 @@ function labelDayType(t) {
 
 export default function HomePage() {
   const nav = useNavigate();
-  const toast = useToast();
   const { state } = useApp();
   const userId = state.session.userId;
   const role = state.session.role;
@@ -41,13 +38,15 @@ export default function HomePage() {
 
   // 学習ログ（今日）
   const logs = useLiveQuery(() => db.answerLogs.where("userId").equals(userId).toArray(), [userId]) || [];
-  const todayMs = useMemo(() => {
-    const start = startOfDayTs(todayKey);
-    const end = start + 86400000;
-    return logs.filter((l) => l.createdAt >= start && l.createdAt < end).reduce((s, l) => s + (l.answerTimeMs || 0), 0);
-  }, [logs, todayKey]);
 
-  const todayMin = Math.round(todayMs / 60000);
+  // ✅ 勉強時間は activityEvents から算出（無操作2分以上除外）
+  const todayStudyMs =
+    useLiveQuery(async () => {
+      return await getStudyTimeMsByDate(userId, todayKey);
+    }, [userId, todayKey]) ?? 0;
+
+  const todayMin = Math.round((todayStudyMs || 0) / 60000);
+
   const goalMin = state.userSettings?.dailyGoalMin ?? null;
   const goalPct = goalMin ? Math.round((todayMin / goalMin) * 100) : null;
   const goalLevel = goalMin ? levelMessage(goalPct) : null;
@@ -148,19 +147,20 @@ export default function HomePage() {
 
         {!hasAnyBook && (role === "user" || role === "teacher" || role === "manager") && (
           <div className="card warn">
-            <div style={{ fontWeight: 950 }}>参考書を１冊も持っていません。まずはここから参考書を追加しましょう。</div>
+            <div style={{ fontWeight: 950 }}>参考書を１冊も持っていません。まずは参考書を追加しましょう。</div>
             <div className="muted">「参考書」から申請できます（承認後に利用可能）。</div>
             <div className="hr" />
-            <button className="btn btn-accent" onClick={() => nav("/app/books")}>参考書へ</button>
+            <button className="btn btn-accent" onClick={() => nav("/app/books")}>
+              参考書へ
+            </button>
           </div>
         )}
 
-        {/* 本日の予定 */}
         {todaySchedules.length > 0 && (
           <>
             <div className="hr" />
             <div className="section-title">本日の予定</div>
-            <div className="muted">複数予定も独立して採用されます</div>
+            <div className="muted">クリックで詳細モーダル →「この範囲を学習する」</div>
             <div className="hr" />
             <div className="grid" style={{ gap: 10 }}>
               {todaySchedules.map((s) => (
@@ -168,7 +168,10 @@ export default function HomePage() {
                   <div className="row" style={{ justifyContent: "space-between" }}>
                     <div>
                       <div style={{ fontWeight: 950 }}>{labelTarget(s)}（予定{s.planIndex || 1}）</div>
-                      <div className="muted">{labelDayType(s.dayType)} / {s.rangeStart != null ? `${s.rangeStart}〜${s.rangeEnd}` : "範囲なし"} / 回数 {s.repeatCount || 1}</div>
+                      <div className="muted">
+                        {labelDayType(s.dayType)} / {s.rangeStart != null ? `${s.rangeStart}〜${s.rangeEnd}` : "範囲なし"} / 回数{" "}
+                        {s.repeatCount || 1}
+                      </div>
                       {s.groupNote && <div className="muted">注釈: {s.groupNote}</div>}
                       {s.dayNote && <div className="muted">注釈: {s.dayNote}</div>}
                     </div>
@@ -176,7 +179,9 @@ export default function HomePage() {
                       {s.dayType === "rest" ? (
                         <span className="pill gray">休息日</span>
                       ) : (
-                        <button className="btn btn-primary" onClick={() => openScheduleDetail(s)}>詳細を見る</button>
+                        <button className="btn btn-primary" onClick={() => openScheduleDetail(s)}>
+                          詳細を見る
+                        </button>
                       )}
                     </div>
                   </div>
@@ -186,7 +191,6 @@ export default function HomePage() {
           </>
         )}
 
-        {/* 予定進捗 */}
         {todaySchedules.length > 0 && (
           <>
             <div className="hr" />
@@ -196,34 +200,29 @@ export default function HomePage() {
                 {todayTestCount}問 / {todayPlanTotal}問　{planPct != null ? `${planPct}%` : ""}
               </div>
               {planPct != null && (
-                <div style={{ fontWeight: 950, color: planLevel.color === "green" ? "#16a34a" : "#dc2626" }}>
-                  {planLevel.msg}
-                </div>
+                <div style={{ fontWeight: 950, color: planLevel.color === "green" ? "#16a34a" : "#dc2626" }}>{planLevel.msg}</div>
               )}
             </div>
           </>
         )}
 
-        {/* 勉強時間 / 目標 */}
         <div className="hr" />
         <div className="card soft">
-          <div className="muted">本日の勉強時間 / 目標</div>
+          <div className="muted">本日の勉強時間 / 目標（無操作2分以上は除外）</div>
           <div style={{ fontSize: 28, fontWeight: 950 }}>
             {todayMin}分 / {goalMin ?? "--"}分　{goalPct != null ? `${goalPct}%` : ""}
           </div>
           {goalPct != null && (
-            <div style={{ fontWeight: 950, color: goalLevel.color === "green" ? "#16a34a" : "#dc2626" }}>
-              {goalLevel.msg}
-            </div>
+            <div style={{ fontWeight: 950, color: goalLevel.color === "green" ? "#16a34a" : "#dc2626" }}>{goalLevel.msg}</div>
           )}
           {goalMin == null && <div className="muted">目標未設定：設定タブで設定できます</div>}
         </div>
 
-        {/* 今週の予定 */}
         <div className="hr" />
         <div className="section-title">今週の予定（7日）</div>
         <div className="muted">クリックで詳細を表示します（即開始しません）</div>
         <div className="hr" />
+
         <div className="grid" style={{ gap: 8 }}>
           {weekKeys.map((k) => {
             const arr = weekMap.get(k) || [];
@@ -234,12 +233,16 @@ export default function HomePage() {
                   <span className="pill gray">{arr.length}件</span>
                 </div>
                 {arr.length === 0 ? (
-                  <div className="muted" style={{ marginTop: 6 }}>予定なし</div>
+                  <div className="muted" style={{ marginTop: 6 }}>
+                    予定なし
+                  </div>
                 ) : (
                   <div className="grid" style={{ gap: 8, marginTop: 8 }}>
                     {arr.map((s) => (
                       <button key={s.id} className="btn" onClick={() => openScheduleDetail(s)} style={{ textAlign: "left" }}>
-                        <div style={{ fontWeight: 950 }}>{labelDayType(s.dayType)} / {labelTarget(s)}</div>
+                        <div style={{ fontWeight: 950 }}>
+                          {labelDayType(s.dayType)} / {labelTarget(s)}
+                        </div>
                         <div className="muted">{s.rangeStart != null ? `${s.rangeStart}〜${s.rangeEnd}` : "範囲なし"}</div>
                       </button>
                     ))}
@@ -250,7 +253,6 @@ export default function HomePage() {
           })}
         </div>
 
-        {/* クイック開始 */}
         <div className="hr" />
         <div className="card info">
           <div style={{ fontWeight: 950 }}>クイック開始</div>
@@ -268,7 +270,9 @@ export default function HomePage() {
         title="予定詳細"
         footer={
           <div className="row" style={{ justifyContent: "space-between" }}>
-            <button className="btn" onClick={() => setDetailOpen(false)}>閉じる</button>
+            <button className="btn" onClick={() => setDetailOpen(false)}>
+              閉じる
+            </button>
             <button className="btn btn-primary" onClick={goToScheduleStudy} disabled={!selectedSchedule || selectedSchedule.dayType === "rest"}>
               この範囲を学習する
             </button>
@@ -296,7 +300,7 @@ export default function HomePage() {
               )}
               {selectedSchedule.dayNote && <div className="muted">日別：{selectedSchedule.dayNote}</div>}
             </div>
-            <div className="smallnote">※設定変更（問題条件/予定編集）は問題設定画面で調整できます。</div>
+            <div className="smallnote">※設定変更は問題設定画面で調整できます。</div>
           </div>
         )}
       </Modal>

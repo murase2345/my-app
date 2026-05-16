@@ -5,7 +5,10 @@ export const ROLE_LABEL = { user: "生徒", teacher: "講師", manager: "教務"
 
 export const db = new Dexie("VocabStudyDB_v4");
 
-// 仕様準拠スキーマ（v3）
+/**
+ * v1: 既存（ユーザー貼り付け版に準拠）
+ * v2: 「保存しているのにスキーマに無い」フィールドを追加し、tsインデックスを活用できる形へ拡張
+ */
 db.version(1).stores({
   users: "userId, role, isActive, *school",
 
@@ -16,41 +19,96 @@ db.version(1).stores({
 
   userBookAccess: "[userId+bookId], userId, bookId, grantedAt",
 
-  // 申請
   bookRequests: "id, userId, bookId, status, createdAt, isHidden",
 
-  // 通知
   notifications: "++id, userId, isRead, createdAt, type",
 
-  // 監査ログ
   bookGrantLogs: "++id, targetUserId, adminUserId, bookId, action, createdAt",
 
-  // 学習ログ
   answerLogs: "++id, userId, wordId, bookId, createdAt, result, isTimeout",
 
-  // 学習時間
   studySessions: "++id, userId, startedAt, endedAt, status",
   activityEvents: "++id, userId, sessionId, type, ts",
 
-  // ライブラリ
   userLibraryItems: "[userId+wordId], userId, wordId, order, addedAt",
 
-  // 自作単語帳（簡易：sharedのみ）
   customBooks: "customBookId, userId, createdAt, name",
   customBookItems: "++id, customBookId, wordKey, createdAt",
 
-  // 予定
   scheduleGroups: "scheduleGroupId, userId, isActive, [userId+isActive], createdAt",
   schedules: "++id, scheduleGroupId, userId, date, planIndex, targetType, targetId, dayType, [userId+date], [scheduleGroupId+userId+date]",
 
   pendingSchedules: "++id, toUserId, fromUserId, status, createdAt",
 
-  // 設定
   userSettings: "userId",
 
-  // 通知個別設定
   userNotifyPrefs: "[ownerUserId+targetUserId], ownerUserId, targetUserId, enabled, updatedAt"
 });
+
+db.version(2)
+  .stores({
+    users: "userId, role, isActive, *school",
+
+    books: "bookId, title",
+    chapters: "chapterId, bookId, number",
+    sharedWords: "wordId, english",
+    wordEntries: "++id, wordId, bookId, chapterId, bookNo, [bookId+chapterId], [wordId+bookId]",
+
+    userBookAccess: "[userId+bookId], userId, bookId, grantedAt",
+
+    // ✅ 追加: comment/decidedBy/decidedAt をスキーマに含める（保存しているため）
+    // 申請一覧の検索（status）も今後に備えて index に残す
+    bookRequests: "id, userId, bookId, status, createdAt, isHidden, comment, decidedBy, decidedAt",
+
+    // ✅ 追加: content/metaJson をスキーマに含める（保存しているため）
+    notifications: "++id, userId, isRead, createdAt, type, content, metaJson",
+
+    bookGrantLogs: "++id, targetUserId, adminUserId, bookId, action, createdAt",
+
+    answerLogs: "++id, userId, wordId, bookId, createdAt, result, isTimeout",
+
+    studySessions: "++id, userId, startedAt, endedAt, status",
+
+    // ✅ 改善: ts をインデックスとして明示利用できるよう store に含める
+    // metaJson を保持（将来の集計/監査で活用可）
+    activityEvents: "++id, userId, ts, sessionId, type, metaJson",
+
+    userLibraryItems: "[userId+wordId], userId, wordId, order, addedAt",
+
+    customBooks: "customBookId, userId, createdAt, name",
+    customBookItems: "++id, customBookId, wordKey, createdAt",
+
+    scheduleGroups: "scheduleGroupId, userId, isActive, [userId+isActive], createdAt",
+    schedules: "++id, scheduleGroupId, userId, date, planIndex, targetType, targetId, dayType, [userId+date], [scheduleGroupId+userId+date]",
+
+    pendingSchedules: "++id, toUserId, fromUserId, status, createdAt",
+
+    userSettings: "userId",
+
+    userNotifyPrefs: "[ownerUserId+targetUserId], ownerUserId, targetUserId, enabled, updatedAt"
+  })
+  .upgrade(async (tx) => {
+    // ✅ 既存データを壊さず「足りない字段」を安全に補完（null→既定値）
+    // 量が多くても致命的にならないよう、必要最低限の補完に限定
+
+    // notifications: content/metaJson が無い古いレコードへ既定を付与
+    await tx.table("notifications").toCollection().modify((n) => {
+      if (n.content === undefined) n.content = "";
+      if (n.metaJson === undefined) n.metaJson = "";
+    });
+
+    // bookRequests: comment/decidedBy/decidedAt の既定
+    await tx.table("bookRequests").toCollection().modify((r) => {
+      if (r.comment === undefined) r.comment = "";
+      if (r.decidedBy === undefined) r.decidedBy = null;
+      if (r.decidedAt === undefined) r.decidedAt = null;
+    });
+
+    // activityEvents: metaJson 既定
+    await tx.table("activityEvents").toCollection().modify((e) => {
+      if (e.metaJson === undefined) e.metaJson = "";
+    });
+  });
 
 export const DEFAULT_USER_SETTINGS = {
   defaultMode: "EN_JA",
@@ -101,7 +159,8 @@ export async function initDbIfEmpty() {
     type: "info",
     content: "ようこそ！",
     isRead: 0,
-    createdAt: Date.now()
+    createdAt: Date.now(),
+    metaJson: ""
   });
 }
 
@@ -170,8 +229,14 @@ export async function getNotifyPrefCount(ownerUserId) {
 }
 
 // 参考書申請
+function safeUuid() {
+  // 古い環境でも落ちない
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
 export async function createBookRequest({ userId, bookId, photoDataUrl }) {
-  const id = crypto.randomUUID();
+  const id = safeUuid();
   const row = {
     id,
     userId,
@@ -202,7 +267,9 @@ export async function notifyBookRequest({ requestId }) {
 
   let targets = [];
   if (requester.role === "user") {
-    targets = allUsers.filter((u) => u.role !== "admin" && (u.role === "teacher" || u.role === "manager") && sameSchool(u, requester));
+    targets = allUsers.filter(
+      (u) => u.role !== "admin" && (u.role === "teacher" || u.role === "manager") && sameSchool(u, requester)
+    );
   } else if (requester.role === "teacher") {
     targets = allUsers.filter((u) => u.role !== "admin" && u.role === "manager" && sameSchool(u, requester));
   } else {
@@ -265,7 +332,8 @@ export async function approveBookRequest({ reqId, actorUserId, comment }) {
       ? `参考書申請「${bookTitle}」が承認されました。\nコメント: ${comment.trim()}`
       : `参考書申請「${bookTitle}」が承認されました。`,
     isRead: 0,
-    createdAt: Date.now()
+    createdAt: Date.now(),
+    metaJson: ""
   });
 
   return req;
@@ -301,7 +369,8 @@ export async function rejectBookRequest({ reqId, actorUserId, comment }) {
     type: "book",
     content: `参考書申請「${bookTitle}」が拒否されました。\n理由: ${comment.trim()}`,
     isRead: 0,
-    createdAt: Date.now()
+    createdAt: Date.now(),
+    metaJson: ""
   });
 
   return req;
@@ -316,73 +385,54 @@ export async function hideRejectedRequest({ reqId, actorUserId }) {
   return req;
 }
 
-// アカウント停止（履歴削除しない）
-export function canStopUser(me, target) {
-  if (target.role === "admin") return false;
-  if (me.role === "admin") return true;
+/**
+ * 勉強時間算出（仕様準拠）
+ * - activityEvents を時系列に並べ、隣接イベント差分を加算
+ * - 無操作2分以上は除外するため、各差分は最大120秒にキャップ
+ * - dateKey（YYYY-MM-DD）単位で合計ms
+ *
+ * ✅ 安全性/速度:
+ * - ts インデックスを使って between(start,end) で当日分だけ取得
+ */
+export async function getStudyTimeMsByDate(userId, dateKey) {
+  const start = new Date(dateKey + "T00:00:00").getTime();
+  const end = start + 86400000;
 
-  if (me.role === "manager") {
-    if (!sameSchool(me, target)) return false;
-    return target.role === "user" || target.role === "teacher";
+  const rows = await db.activityEvents
+    .where("ts")
+    .between(start, end, true, false)
+    .and((e) => e.userId === userId)
+    .toArray();
+
+  if (rows.length < 2) return 0;
+  rows.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+
+  const CAP = 120000;
+  let sum = 0;
+  for (let i = 0; i < rows.length - 1; i++) {
+    const dt = (rows[i + 1].ts || 0) - (rows[i].ts || 0);
+    if (dt <= 0) continue;
+    sum += Math.min(dt, CAP);
   }
-  return false;
+  return sum;
 }
 
-export async function stopAccount({ actorUserId, targetUserId, reason }) {
-  if (!reason || !reason.trim()) throw new Error("停止理由が必須です");
+export function toDateKey(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}`;
+}
 
-  const actor = await db.users.get(actorUserId);
-  const target = await db.users.get(targetUserId);
-  if (!actor || !target) throw new Error("ユーザーが見つかりません");
-  if (!canStopUser(actor, target)) throw new Error("停止権限がありません");
-
-  await db.users.update(targetUserId, { isActive: 0 });
-
-  await db.bookGrantLogs.add({
-    targetUserId,
-    adminUserId: actorUserId,
-    bookId: "",
-    action: "stopAccount",
-    comment: reason.trim(),
-    createdAt: Date.now()
+export async function addActivityEvent({ userId, sessionId, type, metaJson }) {
+  if (!userId) return;
+  await db.activityEvents.add({
+    userId,
+    sessionId: sessionId ?? null,
+    type: type || "action",
+    ts: Date.now(),
+    metaJson: metaJson ?? ""
   });
-}
-
-export async function resumeAccount({ actorUserId, targetUserId, comment }) {
-  const actor = await db.users.get(actorUserId);
-  const target = await db.users.get(targetUserId);
-  if (!actor || !target) throw new Error("ユーザーが見つかりません");
-
-  if (target.role === "admin") throw new Error("管理者は対象外です");
-  if (actor.role !== "admin" && actor.role !== "manager") throw new Error("権限がありません");
-  if (actor.role === "manager" && !sameSchool(actor, target)) throw new Error("権限がありません");
-
-  await db.users.update(targetUserId, { isActive: 1 });
-
-  await db.bookGrantLogs.add({
-    targetUserId,
-    adminUserId: actorUserId,
-    bookId: "",
-    action: "resumeAccount",
-    comment: (comment || "").trim(),
-    createdAt: Date.now()
-  });
-}
-
-// 学習ログ（バッファ）
-const LOG_BUFFER_LIMIT = 20;
-let logBuffer = [];
-
-export async function addAnswerLogBuffered(log) {
-  logBuffer.push(log);
-  if (logBuffer.length >= LOG_BUFFER_LIMIT) await flushAnswerLogs();
-}
-
-export async function flushAnswerLogs() {
-  if (logBuffer.length === 0) return;
-  const batch = logBuffer;
-  logBuffer = [];
-  await db.answerLogs.bulkAdd(batch.map((l) => ({ ...l, createdAt: l.createdAt ?? Date.now() })));
 }
 
 export async function startStudySession({ userId, metaJson }) {
@@ -400,7 +450,19 @@ export async function endStudySession({ sessionId, status }) {
   await db.studySessions.update(sessionId, { endedAt: Date.now(), status: status || "ended" });
 }
 
-export async function addActivityEvent({ userId, sessionId, type, metaJson }) {
-  await db.activityEvents.add({ userId, sessionId, type, ts: Date.now(), metaJson: metaJson || "{}" });
+// 学習ログ（バッファ）
+const LOG_BUFFER_LIMIT = 20;
+let logBuffer = [];
+
+export async function addAnswerLogBuffered(log) {
+  logBuffer.push(log);
+  if (logBuffer.length >= LOG_BUFFER_LIMIT) await flushAnswerLogs();
+}
+
+export async function flushAnswerLogs() {
+  if (logBuffer.length === 0) return;
+  const batch = logBuffer;
+  logBuffer = [];
+  await db.answerLogs.bulkAdd(batch.map((l) => ({ ...l, createdAt: l.createdAt ?? Date.now() })));
 }
 

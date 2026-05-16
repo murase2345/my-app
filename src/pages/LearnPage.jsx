@@ -22,8 +22,12 @@ export default function LearnPage() {
         <div className="muted">「ホーム」タブや「参考書」タブから学習を開始してください。</div>
         <div className="hr" />
         <div className="row" style={{ flexWrap: "wrap" }}>
-          <button className="btn btn-primary" onClick={() => nav("/app/home")}>ホームへ</button>
-          <button className="btn" onClick={() => nav("/app/books")}>参考書へ</button>
+          <button className="btn btn-primary" onClick={() => nav("/app/home")}>
+            ホームへ
+          </button>
+          <button className="btn" onClick={() => nav("/app/books")}>
+            参考書へ
+          </button>
         </div>
       </div>
     );
@@ -39,9 +43,7 @@ export default function LearnPage() {
     useLiveQuery(async () => {
       const set = new Set(queue || []);
       const all = await db.wordEntries.toArray();
-      return all
-        .filter((e) => set.has(`${e.wordId}::${e.bookId}`))
-        .map((e) => ({ ...e, english: sharedById.get(e.wordId) || "" }));
+      return all.filter((e) => set.has(`${e.wordId}::${e.bookId}`)).map((e) => ({ ...e, english: sharedById.get(e.wordId) || "" }));
     }, [queue, sharedById]) || [];
 
   const [idx, setIdx] = useState(0);
@@ -74,8 +76,15 @@ export default function LearnPage() {
   const book = useLiveQuery(() => (entry ? db.books.get(entry.bookId) : null), [entry?.bookId]) || null;
   const sourceText = entry ? `出典：${book?.title || "（参考書）"} / 第${chapter?.number || "?"}章` : "";
 
+  // 開始イベント
+  useEffect(() => {
+    if (!activitySessionId) return;
+    addActivityEvent({ userId, sessionId: activitySessionId, type: "start", metaJson: JSON.stringify({ path: "learn" }) });
+  }, [activitySessionId, userId]);
+
   useEffect(() => {
     if (!entry) return;
+
     startAtRef.current = performance.now();
     setTimedOut(false);
     setSelectedIdx(null);
@@ -93,11 +102,11 @@ export default function LearnPage() {
       setChoices(choices);
       setCorrectIdx(choices.findIndex((c) => c.isCorrect));
     } else {
-      setQText(mode === "EN_JA" ? entry.english : entry.japanese);
+      setQText(mode === "EN_JA" ? entry.english : entry.japanese ?? "");
       setChoices([]);
       setCorrectIdx(null);
     }
-  }, [entryKey, entry?.wordId, entry?.bookId]);
+  }, [entryKey, entry?.wordId, entry?.bookId, questionType, mode, poolEntries]);
 
   useEffect(() => {
     let raf = 0;
@@ -118,7 +127,7 @@ export default function LearnPage() {
     if (questionType !== "MULTI") return;
     if (timedOut) return;
 
-    if (remainMs() === 0) {
+    if (remainMs() <= 0) {
       setTimedOut(true);
       if (selectedIdx != null) {
         judge("timeout");
@@ -129,6 +138,7 @@ export default function LearnPage() {
     }
   }, [nowTick, phase, questionType, selectedIdx, timedOut]);
 
+  // 操作イベント
   useEffect(() => {
     if (!activitySessionId) return;
     const h = () =>
@@ -222,7 +232,10 @@ export default function LearnPage() {
   const next = async () => {
     if (idx + 1 >= queue.length) {
       await flushAnswerLogs();
-      if (activitySessionId) await endStudySession({ sessionId: activitySessionId, status: "complete" });
+      if (activitySessionId) {
+        await addActivityEvent({ userId, sessionId: activitySessionId, type: "end", metaJson: JSON.stringify({ status: "complete" }) });
+        await endStudySession({ sessionId: activitySessionId, status: "complete" });
+      }
       toast.ok("学習が完了しました");
       nav("/app/home");
       return;
@@ -232,7 +245,10 @@ export default function LearnPage() {
 
   const stopStudy = async () => {
     await flushAnswerLogs();
-    if (activitySessionId) await endStudySession({ sessionId: activitySessionId, status: "incomplete" });
+    if (activitySessionId) {
+      await addActivityEvent({ userId, sessionId: activitySessionId, type: "end", metaJson: JSON.stringify({ status: "incomplete" }) });
+      await endStudySession({ sessionId: activitySessionId, status: "incomplete" });
+    }
     toast.warn("中断しました");
     nav("/app/home");
   };
@@ -248,10 +264,15 @@ export default function LearnPage() {
             <div className="muted">{sourceText}</div>
           </div>
           <div className="row" style={{ flexWrap: "wrap", justifyContent: "flex-end" }}>
-            <span className="pill gray">{idx + 1}/{queue.length}</span>
-            <button className="btn" onClick={onAudio}>🔊 音声</button>
-            <button className="btn" onClick={() => nav("/app/question-settings")}>問題設定</button>
-            <button className="btn btn-danger" onClick={() => setStopOpen(true)}>中断</button>
+            <span className="pill gray">
+              {idx + 1}/{queue.length}
+            </span>
+            <button className="btn" onClick={onAudio}>
+              🔊 音声
+            </button>
+            <button className="btn btn-danger" onClick={() => setStopOpen(true)}>
+              中断
+            </button>
           </div>
         </div>
 
@@ -286,8 +307,10 @@ export default function LearnPage() {
               <>
                 <div className="hr" />
                 <div className="muted">答え</div>
-                <div style={{ fontSize: 28, fontWeight: 950 }}>{mode === "EN_JA" ? entry.japanese : entry.english}</div>
-                <div className="smallnote" style={{ marginTop: 10 }}>{entry.note ? `注釈: ${entry.note}` : ""}</div>
+                <div style={{ fontSize: 28, fontWeight: 950 }}>{mode === "EN_JA" ? entry.japanese ?? "" : entry.english ?? ""}</div>
+                <div className="smallnote" style={{ marginTop: 10 }}>
+                  {entry.note ? `注釈: ${entry.note}` : ""}
+                </div>
                 <div className="smallnote">{entry.example ? `例文: ${entry.example}` : ""}</div>
               </>
             )}
@@ -295,8 +318,24 @@ export default function LearnPage() {
 
           <div className="hr" />
           <div className="row" style={{ justifyContent: "space-between", flexWrap: "wrap" }}>
-            <button className="btn btn-danger" onClick={async () => { await judge("flashWrong"); await next(); }}>誤答</button>
-            <button className="btn btn-primary" onClick={async () => { await judge("flashCorrect"); await next(); }}>正解</button>
+            <button
+              className="btn btn-danger"
+              onClick={async () => {
+                await judge("flashWrong");
+                await next();
+              }}
+            >
+              誤答
+            </button>
+            <button
+              className="btn btn-primary"
+              onClick={async () => {
+                await judge("flashCorrect");
+                await next();
+              }}
+            >
+              正解
+            </button>
           </div>
         </div>
       ) : (
@@ -322,10 +361,18 @@ export default function LearnPage() {
               }
               if (isJudge && !keep.has(i)) return null;
 
-              let border = "1px solid #e5e7eb", bg = "#fff";
-              if (isJudge && c.isCorrect) { border = "1px solid #10b981"; bg = "#ecfdf5"; }
-              else if (isJudge && isSel && !c.isCorrect) { border = "1px solid #f43f5e"; bg = "#fff1f2"; }
-              else if (!isJudge && isSel) { border = "1px solid #2563eb"; bg = "#eff6ff"; }
+              let border = "1px solid #e5e7eb",
+                bg = "#fff";
+              if (isJudge && c.isCorrect) {
+                border = "1px solid #10b981";
+                bg = "#ecfdf5";
+              } else if (isJudge && isSel && !c.isCorrect) {
+                border = "1px solid #f43f5e";
+                bg = "#fff1f2";
+              } else if (!isJudge && isSel) {
+                border = "1px solid #2563eb";
+                bg = "#eff6ff";
+              }
 
               return (
                 <label key={c.key} className="choice" style={{ border, background: bg, cursor: isJudge ? "default" : "pointer" }}>
@@ -338,9 +385,13 @@ export default function LearnPage() {
 
           <div className="hr" />
           {phase === "answering" ? (
-            <button className="btn btn-primary btn-big" style={{ width: "100%" }} onClick={() => judge("button")}>解答</button>
+            <button className="btn btn-primary btn-big" style={{ width: "100%" }} onClick={() => judge("button")}>
+              解答
+            </button>
           ) : (
-            <button className="btn btn-primary btn-big" style={{ width: "100%" }} onClick={next}>次へ</button>
+            <button className="btn btn-primary btn-big" style={{ width: "100%" }} onClick={next}>
+              次へ
+            </button>
           )}
         </div>
       )}

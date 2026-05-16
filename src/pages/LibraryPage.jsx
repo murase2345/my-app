@@ -12,6 +12,13 @@ export default function LibraryPage() {
   const lib = useLiveQuery(() => db.userLibraryItems.where("userId").equals(userId).toArray(), [userId]) || [];
   const shared = useLiveQuery(() => db.sharedWords.toArray(), []) || [];
   const sharedById = useMemo(() => new Map(shared.map((w) => [w.wordId, w.english])), [shared]);
+
+  const books = useLiveQuery(() => db.books.toArray(), []) || [];
+  const bookTitle = useMemo(() => new Map(books.map((b) => [b.bookId, b.title])), [books]);
+
+  const chapters = useLiveQuery(() => db.chapters.toArray(), []) || [];
+  const chNum = useMemo(() => new Map(chapters.map((c) => [c.chapterId, c.number])), [chapters]);
+
   const entries = useLiveQuery(() => db.wordEntries.toArray(), []) || [];
 
   const items = useMemo(() => {
@@ -20,11 +27,12 @@ export default function LibraryPage() {
       .filter((e) => set.has(e.wordId))
       .map((e) => ({
         wordKey: `w:${e.wordId}`,
-        title: `${sharedById.get(e.wordId) || ""} / ${e.japanese}`,
-        sub: `book: ${e.bookId} / No.${e.bookNo || 0}`,
-        searchableText: `${sharedById.get(e.wordId) || ""} ${e.japanese} ${e.note || ""} ${e.example || ""}`
+        title: `${sharedById.get(e.wordId) || ""} / ${e.japanese ?? ""}`,
+        // ✅ 内部ID(bookId/chapterId)を表示しない：参考書名＋章番号に統一
+        sub: `${bookTitle.get(e.bookId) || "（参考書）"} / 第${chNum.get(e.chapterId) || "?"}章`,
+        searchableText: `${sharedById.get(e.wordId) || ""} ${e.japanese ?? ""} ${e.note || ""} ${e.example || ""}`
       }));
-  }, [lib, entries, sharedById]);
+  }, [lib, entries, sharedById, bookTitle, chNum]);
 
   return (
     <div className="card">
@@ -36,7 +44,12 @@ export default function LibraryPage() {
       ) : (
         <div className="grid" style={{ gap: 10 }}>
           {items.map((it) => (
-            <button key={it.wordKey} className="btn" onClick={() => nav(`/app/word/${encodeURIComponent(it.wordKey)}`)} style={{ textAlign: "left" }}>
+            <button
+              key={it.wordKey + ":" + it.sub}
+              className="btn"
+              onClick={() => nav(`/app/word/${encodeURIComponent(it.wordKey)}`)}
+              style={{ textAlign: "left" }}
+            >
               <div style={{ fontWeight: 950 }}>{it.title}</div>
               <div className="muted">{it.sub}</div>
             </button>
