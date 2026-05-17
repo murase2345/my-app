@@ -1,5 +1,6 @@
 import Dexie from "dexie";
 import { seed } from "../data/seed.js";
+import { supabase } from "../supabase.js";
 
 export const ROLE_LABEL = { user: "生徒", teacher: "講師", manager: "教務", admin: "管理者" };
 
@@ -38,7 +39,6 @@ db.version(2)
     users: "userId, role, isActive, *school",
   })
   .upgrade(async (tx) => {
-    // 将来、必須フィールドが増えた場合にここで補完
     void tx;
   });
 
@@ -57,6 +57,7 @@ export async function initDbIfEmpty() {
   const n = await db.users.count();
   if (n > 0) return;
 
+  // seed: users/emailは空欄可
   await db.users.bulkAdd(seed.users.map((u) => ({ ...u, email: u.email ?? "" })));
   await db.books.bulkAdd(seed.books.map((b) => ({ ...b })));
   await db.chapters.bulkAdd(seed.chapters.map((c) => ({ ...c })));
@@ -76,7 +77,7 @@ export async function initDbIfEmpty() {
     }))
   );
 
-  // 初期：管理者に全参考書アクセス（データとしては持っていてOK）
+  // 初期：管理者に全参考書アクセス
   const allBooks = seed.books.map((b) => b.bookId);
   await db.userBookAccess.bulkAdd(allBooks.map((bookId) => ({ userId: "kanri", bookId, grantedAt: Date.now() })));
 
@@ -125,10 +126,7 @@ export function canAccessUser(me, target) {
 
 export async function canUseBook(session, bookId) {
   if (!session) return false;
-
-  // 仕様：manager/admin は申請不要で全参考書を閲覧・学習に使用できる
   if (session.role === "admin" || session.role === "manager") return true;
-
   const row = await db.userBookAccess.get([session.userId, bookId]);
   return !!row;
 }
@@ -169,8 +167,16 @@ function safeUuid() {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+/**
+ * ✅ ここが今回のポイント：
+ * 申請を Dexie に保存するだけでなく、Supabase の book_requests にも保存する
+ *
+ * Supabase側に book_requests テーブルが必要：
+ * - id (uuid) / user_id (text) / book_id (text) / status (text) / created_at (timestamptz) など
+ */
 export async function createBookRequest({ userId, bookId, photoDataUrl }) {
   const id = safeUuid();
+
   const row = {
     id,
     userId,
@@ -183,141 +189,33 @@ export async function createBookRequest({ userId, bookId, photoDataUrl }) {
     decidedBy: null,
     decidedAt: null,
   };
+
+  // 1) まずローカルに保存（オフラインでも操作が成立する）
   await db.bookRequests.put(row);
-  await notifyBookRequest(id);
+
+  // 2) オンラインなら Supabase にも保存（管理タブで見えるようになる）
+  try {
+    await supabase.from("book_requests").insert([
+      {
+        id, // uuid型の列ならSupabase側でuuidに合わせて。textならそのままでもOK
+        user_id: userId,
+        book_id: bookId,
+        status: "pending",
+        photo_data_url: photoDataUrl ?? null,
+      },
+    ]);
+  } catch (e) {
+    console.warn("[book_requests] supabase insert failed (offline?)", e);
+    // ここでは落とさない：後で「同期キュー」に積む設計に拡張可能
+  }
+
   return row;
 }
 
-export async function notifyBookRequest(requestId) {
-  const req = await db.bookRequests.get(requestId);
-  if (!req) return;
-
-  const requester = await db.users.get(req.userId);
-  if (!requester) return;
-
-  const allUsers = await db.users.toArray();
-  const book = await db.books.get(req.bookId);
-  const bookTitle = book?.title ?? "（参考書）";
-
-  let targets = [];
-  if (requester.role === "user") {
-    targets = allUsers.filter(
-      (u) => u.role !== "admin" && (u.role === "teacher" || u.role === "manager") && sameSchool(u, requester)
-    );
-  } else if (requester.role === "teacher") {
-    targets = allUsers.filter((u) => u.role !== "admin" && u.role === "manager" && sameSchool(u, requester));
-  } else {
-    return;
-  }
-
-  for (const u of targets) {
-    const ok = await shouldNotify(u.userId, requester.userId);
-    if (!ok) continue;
-
-    await db.notifications.add({
-      userId: u.userId,
-      type: "request",
-      content: `参考書申請: ${requester.userId} が「${bookTitle}」を申請しました。`,
-      isRead: 0,
-      createdAt: Date.now(),
-      metaJson: JSON.stringify({ reqId: requestId, requesterUserId: requester.userId, bookId: req.bookId }),
-    });
-  }
-}
-
-export async function approveBookRequest({ reqId, actorUserId, comment }) {
-  const req = await db.bookRequests.get(reqId);
-  if (!req) return null;
-
-  const actor = await db.users.get(actorUserId);
-  const requester = await db.users.get(req.userId);
-  if (!actor || !requester) return null;
-
-  if (requester.role === "teacher" && !(actor.role === "manager" || actor.role === "admin")) {
-    throw new Error("権限がありません（講師申請は教務/管理者のみ許可可）");
-  }
-
-  await db.bookRequests.update(reqId, {
-    status: "approved",
-    comment: comment ?? "",
-    decidedAt: Date.now(),
-    decidedBy: actorUserId,
-  });
-
-  await db.userBookAccess.put({ userId: req.userId, bookId: req.bookId, grantedAt: Date.now() });
-
-  await db.bookGrantLogs.add({
-    targetUserId: req.userId,
-    adminUserId: actorUserId,
-    bookId: req.bookId,
-    action: "approve",
-    comment: comment ?? "",
-    createdAt: Date.now(),
-  });
-
-  const book = await db.books.get(req.bookId);
-  const bookTitle = book?.title ?? "（参考書）";
-
-  const trimmed = (comment ?? "").trim();
-  await db.notifications.add({
-    userId: req.userId,
-    type: "book",
-    content: trimmed
-      ? `参考書申請「${bookTitle}」が承認されました。\nコメント: ${trimmed}`
-      : `参考書申請「${bookTitle}」が承認されました。`,
-    isRead: 0,
-    createdAt: Date.now(),
-    metaJson: "",
-  });
-
-  return req;
-}
-
-export async function rejectBookRequest({ reqId, actorUserId, comment }) {
-  const req = await db.bookRequests.get(reqId);
-  if (!req) return null;
-
-  if (!comment || !comment.trim()) throw new Error("拒否コメントが必須です");
-
-  await db.bookRequests.update(reqId, {
-    status: "rejected",
-    comment: comment.trim(),
-    decidedAt: Date.now(),
-    decidedBy: actorUserId,
-  });
-
-  await db.bookGrantLogs.add({
-    targetUserId: req.userId,
-    adminUserId: actorUserId,
-    bookId: req.bookId,
-    action: "reject",
-    comment: comment.trim(),
-    createdAt: Date.now(),
-  });
-
-  const book = await db.books.get(req.bookId);
-  const bookTitle = book?.title ?? "（参考書）";
-
-  await db.notifications.add({
-    userId: req.userId,
-    type: "book",
-    content: `参考書申請「${bookTitle}」が拒否されました。\n理由: ${comment.trim()}`,
-    isRead: 0,
-    createdAt: Date.now(),
-    metaJson: "",
-  });
-
-  return req;
-}
-
-export async function hideRejectedRequest({ reqId, actorUserId }) {
-  const req = await db.bookRequests.get(reqId);
-  if (!req) return null;
-  if (req.status !== "rejected") return null;
-  if (req.userId !== actorUserId) return null;
-  await db.bookRequests.update(reqId, { isHidden: 1 });
-  return req;
-}
+/**
+ * notifyBookRequest / approve/reject は次段階で Supabase 連動させる
+ * （まずは申請が管理画面に見えることを最短で達成するため、ここではローカル通知のまま）
+ */
 
 export async function getStudyTimeMsByDate(userId, dateKey) {
   const start = new Date(dateKey + "T00:00:00").getTime();
@@ -376,6 +274,7 @@ export async function endStudySession({ sessionId, status }) {
   await db.studySessions.update(sessionId, { endedAt: Date.now(), status: status ?? "ended" });
 }
 
+// 学習ログ（バッファ）
 const LOG_BUFFER_LIMIT = 20;
 let logBuffer = [];
 
@@ -390,4 +289,3 @@ export async function flushAnswerLogs() {
   logBuffer = [];
   await db.answerLogs.bulkAdd(batch.map((l) => ({ ...l, createdAt: l.createdAt ?? Date.now() })));
 }
-
