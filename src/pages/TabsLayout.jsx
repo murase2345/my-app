@@ -1,50 +1,73 @@
 import { Outlet, useNavigate } from "react-router-dom";
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
+import { useLiveQuery } from "dexie-react-hooks";
 import { useApp } from "../store/AppContext.jsx";
 import TabBar from "../components/TabBar.jsx";
-import { supabase } from "../supabase.js";
+import { db } from "../db/db.js";
+import { pullLatestNotifications, startNotificationsRealtime } from "../sync/notificationsSync.js";
+
+const ROLE_JA = { user: "生徒", teacher: "講師", manager: "教務", admin: "管理者" };
 
 export default function TabsLayout({ showAdmin }) {
   const nav = useNavigate();
   const { state, api } = useApp();
 
-  // ✅ /app 配下のどこにいても Realtime を受け取る（テスト用）
+  const userId = state.session?.userId ?? "";
+  const role = state.session?.role ?? "user";
+
+  // 未読数（Dexieを正とする）
+  const unreadCount =
+    useLiveQuery(async () => {
+      if (!userId) return 0;
+      const rows = await db.notifications.where("userId").equals(userId).toArray();
+      return rows.filter((n) => (n.isRead ?? 0) === 0).length;
+    }, [userId]) ?? 0;
+
+  // Realtime同期：/app 配下のどこにいても動く
   useEffect(() => {
-    // env確認（ここが undefined なら .env.local が読めていない）
-    console.log("URL:", import.meta.env.VITE_SUPABASE_URL);
-    console.log("KEY:", import.meta.env.VITE_SUPABASE_ANON_KEY ? "(set)" : "(missing)");
+    if (!userId) return;
 
-    const channel = supabase
-      .channel("notifications-global")
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "notifications" },
-        (payload) => {
-          console.log("🔥通知INSERT受信", payload.new);
-        }
-      )
-      .subscribe();
+    // 取りこぼし対策：最初にまとめてpull
+    pullLatestNotifications(userId, 50);
 
-    return () => {
-      supabase.removeChannel(channel);
-    };
-  }, []);
+    // Realtime購読開始
+    const stop = startNotificationsRealtime(userId);
+
+    return () => stop();
+  }, [userId]);
+
+  const roleJa = useMemo(() => ROLE_JA[role] ?? role, [role]);
 
   return (
     <>
+      {/* 固定ヘッダー（仕様：userId + ロール日本語） */}
       <div className="topbar">
         <div className="topbar-inner">
           <div style={{ fontWeight: 950 }}>📘 Vocab Study</div>
 
-          {/* ログイン情報（仕様：userId + ロール表示） */}
-          <div className="muted">
-            {state.session?.userId}（{state.session?.role}）
+          <div className="muted" style={{ fontWeight: 900 }}>
+            {userId}（{roleJa}）
           </div>
 
-          <div className="row" style={{ gap: 8 }}>
-            <button className="btn" onClick={() => nav("/app/notifications")}>
+          <div className="row" style={{ gap: 8, alignItems: "center" }}>
+            <button className="btn" onClick={() => nav("/app/notifications")} style={{ position: "relative" }}>
               🔔
+              {unreadCount > 0 && (
+                <span
+                  style={{
+                    position: "absolute",
+                    top: -4,
+                    right: -4,
+                    width: 10,
+                    height: 10,
+                    borderRadius: 999,
+                    background: "#ef4444",
+                    display: "inline-block",
+                  }}
+                />
+              )}
             </button>
+
             <button
               className="btn"
               onClick={() => {
@@ -58,14 +81,15 @@ export default function TabsLayout({ showAdmin }) {
         </div>
       </div>
 
-      {/* タブバー（既存） */}
-      <TabBar showAdmin={showAdmin} />
+      {/* タブバー */}
+      <TabBar showAdmin={showAdmin} unreadCount={unreadCount} />
 
-      {/* ここが無いと /app 配下の子ページが出ない */}
+      {/* 子ルート */}
       <div className="container">
         <Outlet />
       </div>
     </>
   );
 }
+
 

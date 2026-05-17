@@ -1,14 +1,12 @@
 import { createClient } from "@supabase/supabase-js";
 
 const url = import.meta.env.VITE_SUPABASE_URL;
-const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const key = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
-if (!url || !anonKey) {
-  console.warn(
-    "[supabase] URL または KEY が未設定です (.env.local を確認)"
-  );
+if (!url || !key) {
+  console.warn("[supabase] VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY が未設定です (.env.local / Vercel env を確認)");
 }
 
-export const supabase = createClient(url ?? "", anonKey ?? "");
+export const supabase = createClient(url ?? "", key ?? "");
 
 
