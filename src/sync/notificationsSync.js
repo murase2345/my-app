@@ -3,27 +3,26 @@ import { db } from "../db/db.js";
 
 /**
  * Supabase notifications(row) -> Dexie notifications(row)
- * Dexie schema: notifications: "++id, userId, isRead, createdAt, type" なので、
- * 追加フィールドは保存できる（ただしindexは無い）前提で cloudId を持たせる。
+ * Dexie schema: notifications: "++id, userId, isRead, createdAt, type"
+ * content/cloudId は「追加フィールド」として保存（indexは無いが保存は可能）
  */
+
 function toLocalRow(remote) {
   const createdAt = remote.created_at ? new Date(remote.created_at).getTime() : Date.now();
   return {
-    // Dexie側は ++id のため id は付けない（自動採番）
     userId: remote.user_id,
     type: remote.type ?? "info",
     content: remote.content ?? "",
     isRead: remote.is_read ? 1 : 0,
     createdAt,
-    // 追加フィールド（重複判定用）
-    cloudId: remote.id,
+    cloudId: remote.id, // 追加フィールド（重複判定用）
   };
 }
 
 async function upsertLocal(remote) {
   const local = toLocalRow(remote);
 
-  // 既存スキーマに cloudId index が無い想定なので userId 範囲で絞ってから手動検索（件数が少ない間はこれでOK）
+  // cloudId indexが無いので userId で絞ってから手動検索
   const mine = await db.notifications.where("userId").equals(local.userId).toArray();
   const hit = mine.find((n) => n.cloudId === local.cloudId);
 
@@ -55,6 +54,7 @@ export async function pullLatestNotifications(userId, limit = 50) {
     console.warn("[supabase] pullLatestNotifications error:", error.message);
     return;
   }
+
   for (const row of data ?? []) {
     await upsertLocal(row);
   }
@@ -88,14 +88,10 @@ export function startNotificationsRealtime(userId) {
         await upsertLocal(row);
       }
     )
-    .subscribe((status) => {
-      // デバッグ用（必要なければ消してOK）
-      // console.log("[supabase] realtime status:", status);
-    });
+    .subscribe();
 
   return () => {
     supabase.removeChannel(channel);
   };
 }
-
-
+``
