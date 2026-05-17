@@ -6,108 +6,40 @@ export const ROLE_LABEL = { user: "生徒", teacher: "講師", manager: "教務"
 export const db = new Dexie("VocabStudyDB_v4");
 
 /**
- * v1: 既存（ユーザー貼り付け版に準拠）
- * v2: 「保存しているのにスキーマに無い」フィールドを追加し、tsインデックスを活用できる形へ拡張
+ * v1: 初期
+ * v2: 既存データを壊さず拡張（最低限の補完のみ）
  */
 db.version(1).stores({
   users: "userId, role, isActive, *school",
-
   books: "bookId, title",
   chapters: "chapterId, bookId, number",
   sharedWords: "wordId, english",
   wordEntries: "++id, wordId, bookId, chapterId, bookNo, [bookId+chapterId], [wordId+bookId]",
-
   userBookAccess: "[userId+bookId], userId, bookId, grantedAt",
-
   bookRequests: "id, userId, bookId, status, createdAt, isHidden",
-
   notifications: "++id, userId, isRead, createdAt, type",
-
   bookGrantLogs: "++id, targetUserId, adminUserId, bookId, action, createdAt",
-
   answerLogs: "++id, userId, wordId, bookId, createdAt, result, isTimeout",
-
   studySessions: "++id, userId, startedAt, endedAt, status",
   activityEvents: "++id, userId, sessionId, type, ts",
-
   userLibraryItems: "[userId+wordId], userId, wordId, order, addedAt",
-
   customBooks: "customBookId, userId, createdAt, name",
   customBookItems: "++id, customBookId, wordKey, createdAt",
-
   scheduleGroups: "scheduleGroupId, userId, isActive, [userId+isActive], createdAt",
-  schedules: "++id, scheduleGroupId, userId, date, planIndex, targetType, targetId, dayType, [userId+date], [scheduleGroupId+userId+date]",
-
+  schedules:
+    "++id, scheduleGroupId, userId, date, planIndex, targetType, targetId, dayType, [userId+date], [scheduleGroupId+userId+date]",
   pendingSchedules: "++id, toUserId, fromUserId, status, createdAt",
-
   userSettings: "userId",
-
-  userNotifyPrefs: "[ownerUserId+targetUserId], ownerUserId, targetUserId, enabled, updatedAt"
+  userNotifyPrefs: "[ownerUserId+targetUserId], ownerUserId, targetUserId, enabled, updatedAt",
 });
 
 db.version(2)
   .stores({
     users: "userId, role, isActive, *school",
-
-    books: "bookId, title",
-    chapters: "chapterId, bookId, number",
-    sharedWords: "wordId, english",
-    wordEntries: "++id, wordId, bookId, chapterId, bookNo, [bookId+chapterId], [wordId+bookId]",
-
-    userBookAccess: "[userId+bookId], userId, bookId, grantedAt",
-
-    // ✅ 追加: comment/decidedBy/decidedAt をスキーマに含める（保存しているため）
-    // 申請一覧の検索（status）も今後に備えて index に残す
-    bookRequests: "id, userId, bookId, status, createdAt, isHidden, comment, decidedBy, decidedAt",
-
-    // ✅ 追加: content/metaJson をスキーマに含める（保存しているため）
-    notifications: "++id, userId, isRead, createdAt, type, content, metaJson",
-
-    bookGrantLogs: "++id, targetUserId, adminUserId, bookId, action, createdAt",
-
-    answerLogs: "++id, userId, wordId, bookId, createdAt, result, isTimeout",
-
-    studySessions: "++id, userId, startedAt, endedAt, status",
-
-    // ✅ 改善: ts をインデックスとして明示利用できるよう store に含める
-    // metaJson を保持（将来の集計/監査で活用可）
-    activityEvents: "++id, userId, ts, sessionId, type, metaJson",
-
-    userLibraryItems: "[userId+wordId], userId, wordId, order, addedAt",
-
-    customBooks: "customBookId, userId, createdAt, name",
-    customBookItems: "++id, customBookId, wordKey, createdAt",
-
-    scheduleGroups: "scheduleGroupId, userId, isActive, [userId+isActive], createdAt",
-    schedules: "++id, scheduleGroupId, userId, date, planIndex, targetType, targetId, dayType, [userId+date], [scheduleGroupId+userId+date]",
-
-    pendingSchedules: "++id, toUserId, fromUserId, status, createdAt",
-
-    userSettings: "userId",
-
-    userNotifyPrefs: "[ownerUserId+targetUserId], ownerUserId, targetUserId, enabled, updatedAt"
   })
   .upgrade(async (tx) => {
-    // ✅ 既存データを壊さず「足りない字段」を安全に補完（null→既定値）
-    // 量が多くても致命的にならないよう、必要最低限の補完に限定
-
-    // notifications: content/metaJson が無い古いレコードへ既定を付与
-    await tx.table("notifications").toCollection().modify((n) => {
-      if (n.content === undefined) n.content = "";
-      if (n.metaJson === undefined) n.metaJson = "";
-    });
-
-    // bookRequests: comment/decidedBy/decidedAt の既定
-    await tx.table("bookRequests").toCollection().modify((r) => {
-      if (r.comment === undefined) r.comment = "";
-      if (r.decidedBy === undefined) r.decidedBy = null;
-      if (r.decidedAt === undefined) r.decidedAt = null;
-    });
-
-    // activityEvents: metaJson 既定
-    await tx.table("activityEvents").toCollection().modify((e) => {
-      if (e.metaJson === undefined) e.metaJson = "";
-    });
+    // 将来、必須フィールドが増えた場合にここで補完
+    void tx;
   });
 
 export const DEFAULT_USER_SETTINGS = {
@@ -118,14 +50,14 @@ export const DEFAULT_USER_SETTINGS = {
   audioVolume: 1.0,
   audioRate: 1.0,
   dailyGoalMin: null,
-  notificationGlobalOff: false
+  notificationGlobalOff: false,
 };
 
 export async function initDbIfEmpty() {
   const n = await db.users.count();
   if (n > 0) return;
 
-  await db.users.bulkAdd(seed.users.map((u) => ({ ...u })));
+  await db.users.bulkAdd(seed.users.map((u) => ({ ...u, email: u.email ?? "" })));
   await db.books.bulkAdd(seed.books.map((b) => ({ ...b })));
   await db.chapters.bulkAdd(seed.chapters.map((c) => ({ ...c })));
   await db.sharedWords.bulkAdd(seed.sharedWords.map((w) => ({ ...w })));
@@ -140,11 +72,11 @@ export async function initDbIfEmpty() {
       note: e.note ?? "",
       related: e.related ?? "",
       example: e.example ?? "",
-      audioUrl: e.audioUrl ?? ""
+      audioUrl: e.audioUrl ?? "",
     }))
   );
 
-  // 初期：管理者に全参考書アクセス
+  // 初期：管理者に全参考書アクセス（データとしては持っていてOK）
   const allBooks = seed.books.map((b) => b.bookId);
   await db.userBookAccess.bulkAdd(allBooks.map((bookId) => ({ userId: "kanri", bookId, grantedAt: Date.now() })));
 
@@ -160,13 +92,14 @@ export async function initDbIfEmpty() {
     content: "ようこそ！",
     isRead: 0,
     createdAt: Date.now(),
-    metaJson: ""
+    metaJson: "",
   });
 }
 
 export async function getUserSettings(userId) {
   const row = await db.userSettings.get(userId);
-  if (row) return { ...DEFAULT_USER_SETTINGS, ...row };
+  if (row) return row;
+
   const init = { userId, ...DEFAULT_USER_SETTINGS };
   await db.userSettings.put(init);
   return init;
@@ -180,8 +113,8 @@ export async function saveUserSettings(userId, patch) {
 }
 
 export function sameSchool(a, b) {
-  const as = a?.school || [];
-  const bs = b?.school || [];
+  const as = a?.school ?? [];
+  const bs = b?.school ?? [];
   return as.some((s) => bs.includes(s));
 }
 
@@ -192,7 +125,10 @@ export function canAccessUser(me, target) {
 
 export async function canUseBook(session, bookId) {
   if (!session) return false;
-  if (session.role === "admin") return true;
+
+  // 仕様：manager/admin は申請不要で全参考書を閲覧・学習に使用できる
+  if (session.role === "admin" || session.role === "manager") return true;
+
   const row = await db.userBookAccess.get([session.userId, bookId]);
   return !!row;
 }
@@ -205,7 +141,6 @@ export async function shouldNotify(ownerUserId, targetUserId) {
 
   if (pref?.enabled === 1) return true;
   if (pref?.enabled === 0) return false;
-
   return !globalOff;
 }
 
@@ -230,7 +165,6 @@ export async function getNotifyPrefCount(ownerUserId) {
 
 // 参考書申請
 function safeUuid() {
-  // 古い環境でも落ちない
   if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
@@ -247,14 +181,14 @@ export async function createBookRequest({ userId, bookId, photoDataUrl }) {
     isHidden: 0,
     comment: "",
     decidedBy: null,
-    decidedAt: null
+    decidedAt: null,
   };
   await db.bookRequests.put(row);
-  await notifyBookRequest({ requestId: id });
+  await notifyBookRequest(id);
   return row;
 }
 
-export async function notifyBookRequest({ requestId }) {
+export async function notifyBookRequest(requestId) {
   const req = await db.bookRequests.get(requestId);
   if (!req) return;
 
@@ -263,7 +197,7 @@ export async function notifyBookRequest({ requestId }) {
 
   const allUsers = await db.users.toArray();
   const book = await db.books.get(req.bookId);
-  const bookTitle = book?.title || "（参考書）";
+  const bookTitle = book?.title ?? "（参考書）";
 
   let targets = [];
   if (requester.role === "user") {
@@ -273,7 +207,7 @@ export async function notifyBookRequest({ requestId }) {
   } else if (requester.role === "teacher") {
     targets = allUsers.filter((u) => u.role !== "admin" && u.role === "manager" && sameSchool(u, requester));
   } else {
-    targets = [];
+    return;
   }
 
   for (const u of targets) {
@@ -282,11 +216,11 @@ export async function notifyBookRequest({ requestId }) {
 
     await db.notifications.add({
       userId: u.userId,
-      type: "bookRequest",
-      content: `${requester.userId} が「${bookTitle}」の参考書申請を送りました`,
+      type: "request",
+      content: `参考書申請: ${requester.userId} が「${bookTitle}」を申請しました。`,
       isRead: 0,
       createdAt: Date.now(),
-      metaJson: JSON.stringify({ requestId })
+      metaJson: JSON.stringify({ reqId: requestId, requesterUserId: requester.userId, bookId: req.bookId }),
     });
   }
 }
@@ -299,16 +233,15 @@ export async function approveBookRequest({ reqId, actorUserId, comment }) {
   const requester = await db.users.get(req.userId);
   if (!actor || !requester) return null;
 
-  // teacher申請は manager/admin のみ
   if (requester.role === "teacher" && !(actor.role === "manager" || actor.role === "admin")) {
     throw new Error("権限がありません（講師申請は教務/管理者のみ許可可）");
   }
 
   await db.bookRequests.update(reqId, {
     status: "approved",
-    comment: comment || "",
+    comment: comment ?? "",
     decidedAt: Date.now(),
-    decidedBy: actorUserId
+    decidedBy: actorUserId,
   });
 
   await db.userBookAccess.put({ userId: req.userId, bookId: req.bookId, grantedAt: Date.now() });
@@ -318,22 +251,23 @@ export async function approveBookRequest({ reqId, actorUserId, comment }) {
     adminUserId: actorUserId,
     bookId: req.bookId,
     action: "approve",
-    comment: comment || "",
-    createdAt: Date.now()
+    comment: comment ?? "",
+    createdAt: Date.now(),
   });
 
   const book = await db.books.get(req.bookId);
-  const bookTitle = book?.title || "（参考書）";
+  const bookTitle = book?.title ?? "（参考書）";
 
+  const trimmed = (comment ?? "").trim();
   await db.notifications.add({
     userId: req.userId,
     type: "book",
-    content: comment?.trim()
-      ? `参考書申請「${bookTitle}」が承認されました。\nコメント: ${comment.trim()}`
+    content: trimmed
+      ? `参考書申請「${bookTitle}」が承認されました。\nコメント: ${trimmed}`
       : `参考書申請「${bookTitle}」が承認されました。`,
     isRead: 0,
     createdAt: Date.now(),
-    metaJson: ""
+    metaJson: "",
   });
 
   return req;
@@ -349,7 +283,7 @@ export async function rejectBookRequest({ reqId, actorUserId, comment }) {
     status: "rejected",
     comment: comment.trim(),
     decidedAt: Date.now(),
-    decidedBy: actorUserId
+    decidedBy: actorUserId,
   });
 
   await db.bookGrantLogs.add({
@@ -358,11 +292,11 @@ export async function rejectBookRequest({ reqId, actorUserId, comment }) {
     bookId: req.bookId,
     action: "reject",
     comment: comment.trim(),
-    createdAt: Date.now()
+    createdAt: Date.now(),
   });
 
   const book = await db.books.get(req.bookId);
-  const bookTitle = book?.title || "（参考書）";
+  const bookTitle = book?.title ?? "（参考書）";
 
   await db.notifications.add({
     userId: req.userId,
@@ -370,7 +304,7 @@ export async function rejectBookRequest({ reqId, actorUserId, comment }) {
     content: `参考書申請「${bookTitle}」が拒否されました。\n理由: ${comment.trim()}`,
     isRead: 0,
     createdAt: Date.now(),
-    metaJson: ""
+    metaJson: "",
   });
 
   return req;
@@ -385,15 +319,6 @@ export async function hideRejectedRequest({ reqId, actorUserId }) {
   return req;
 }
 
-/**
- * 勉強時間算出（仕様準拠）
- * - activityEvents を時系列に並べ、隣接イベント差分を加算
- * - 無操作2分以上は除外するため、各差分は最大120秒にキャップ
- * - dateKey（YYYY-MM-DD）単位で合計ms
- *
- * ✅ 安全性/速度:
- * - ts インデックスを使って between(start,end) で当日分だけ取得
- */
 export async function getStudyTimeMsByDate(userId, dateKey) {
   const start = new Date(dateKey + "T00:00:00").getTime();
   const end = start + 86400000;
@@ -405,12 +330,13 @@ export async function getStudyTimeMsByDate(userId, dateKey) {
     .toArray();
 
   if (rows.length < 2) return 0;
-  rows.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+
+  rows.sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0));
 
   const CAP = 120000;
   let sum = 0;
   for (let i = 0; i < rows.length - 1; i++) {
-    const dt = (rows[i + 1].ts || 0) - (rows[i].ts || 0);
+    const dt = (rows[i + 1].ts ?? 0) - (rows[i].ts ?? 0);
     if (dt <= 0) continue;
     sum += Math.min(dt, CAP);
   }
@@ -429,9 +355,9 @@ export async function addActivityEvent({ userId, sessionId, type, metaJson }) {
   await db.activityEvents.add({
     userId,
     sessionId: sessionId ?? null,
-    type: type || "action",
+    type: type ?? "action",
     ts: Date.now(),
-    metaJson: metaJson ?? ""
+    metaJson: metaJson ?? "",
   });
 }
 
@@ -441,16 +367,15 @@ export async function startStudySession({ userId, metaJson }) {
     startedAt: Date.now(),
     endedAt: null,
     status: "active",
-    metaJson: metaJson || "{}"
+    metaJson: metaJson ?? "",
   });
   return id;
 }
 
 export async function endStudySession({ sessionId, status }) {
-  await db.studySessions.update(sessionId, { endedAt: Date.now(), status: status || "ended" });
+  await db.studySessions.update(sessionId, { endedAt: Date.now(), status: status ?? "ended" });
 }
 
-// 学習ログ（バッファ）
 const LOG_BUFFER_LIMIT = 20;
 let logBuffer = [];
 

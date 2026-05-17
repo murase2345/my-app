@@ -22,14 +22,23 @@ import NotFound from "./pages/NotFound.jsx";
 
 function Guard({ children }) {
   const { state } = useApp();
-  if (!state.booted) return <div className="container"><div className="card">起動中…</div></div>;
+  if (!state.booted) {
+    return (
+      <div className="container">
+        <div className="card">起動中…</div>
+      </div>
+    );
+  }
   if (!state.session) return <Navigate to="/login" replace />;
   return children;
 }
 
 function AppRoutes() {
   const { state } = useApp();
-  const showAdmin = state.session?.role === "admin" || state.session?.role === "manager" || state.session?.role === "teacher";
+  const showAdmin =
+    state.session?.role === "admin" ||
+    state.session?.role === "manager" ||
+    state.session?.role === "teacher";
 
   return (
     <Routes>
@@ -37,13 +46,14 @@ function AppRoutes() {
       <Route path="/login" element={<LoginPage />} />
 
       <Route
-        path="/app/*"
+        path="/app"
         element={
           <Guard>
             <TabsLayout showAdmin={showAdmin} />
           </Guard>
         }
       >
+        <Route index element={<Navigate to="home" replace />} />
         <Route path="home" element={<HomePage />} />
         <Route path="learn" element={<LearnPage />} />
         <Route path="question-settings" element={<QuestionSettingsPage />} />
@@ -74,4 +84,3 @@ export default function App() {
     </AppProvider>
   );
 }
-
