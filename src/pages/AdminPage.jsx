@@ -1,69 +1,201 @@
-import { useMemo, useState } from "react";
-import { useLiveQuery } from "dexie-react-hooks";
+import { useEffect, useMemo, useState } from "react";
 import Modal from "../components/Modal.jsx";
 import { useToast } from "../components/Toast.jsx";
 import { useApp } from "../store/AppContext.jsx";
 import { db, ROLE_LABEL, canAccessUser, approveBookRequest, rejectBookRequest } from "../db/db.js";
+import { supabase } from "../supabase.js";
 
-function uniq(arr) { return Array.from(new Set(arr)); }
-const svgToDataUrl = (svg) => `data:image/svg+xml;utf8,${encodeURIComponent(svg || "")}`;
+function uniq(arr) {
+  return Array.from(new Set(arr));
+}
+
+const svgToDataUrl = (svg) => `data:image/svg+xml;utf8,${encodeURIComponent(svg ?? "")}`;
 
 export default function AdminPage() {
   const toast = useToast();
   const { state } = useApp();
   const me = state.session;
 
-  const users = useLiveQuery(() => db.users.toArray(), []) || [];
-  const books = useLiveQuery(() => db.books.toArray(), []) || [];
+  // ローカルの参照情報（ユーザー・参考書マスタ）
+  const [users, setUsers] = useState([]);
+  const [books, setBooks] = useState([]);
+
+  // Supabase から取る「承認待ち申請」
+  const [requests, setRequests] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  // モーダル状態
+  const [reqOpen, setReqOpen] = useState(false);
+  const [selectedReq, setSelectedReq] = useState(null);
+  const [reqComment, setReqComment] = useState("");
+
+  // ローカル読込（users/books）
+  useEffect(() => {
+    (async () => {
+      const us = await db.users.toArray();
+      const bs = await db.books.toArray();
+      setUsers(us);
+      setBooks(bs);
+    })();
+  }, []);
+
   const bookTitle = useMemo(() => new Map(books.map((b) => [b.bookId, b.title])), [books]);
 
   const schoolOptions = useMemo(() => {
-    const all = users.flatMap((u) => u.school || []);
+    const all = users.flatMap((u) => u.school ?? []);
     return uniq(all.filter((x) => x !== "ADMIN")).sort((a, b) => a.localeCompare(b));
   }, [users]);
 
-  const requests = useLiveQuery(async () => {
-    const all = await db.bookRequests.toArray();
-    const reqs = all
-      .filter((r) => r.status === "pending")
-      .filter((r) => {
-        const u = users.find((x) => x.userId === r.userId);
+  // Supabaseから「pending」だけ取得して、権限フィルタ（ローカルusers情報で判断）
+  async function loadRequests() {
+    setLoading(true);
+    try {
+      const { data, error } = await supabase
+        .from("book_requests")
+        .select("*")
+        .eq("status", "pending")
+        .order("created_at", { ascending: false });
+
+      if (error) {
+        toast.ng(`申請取得に失敗: ${error.message}`);
+        setLoading(false);
+        return;
+      }
+
+      const filtered = (data ?? []).filter((r) => {
+        const u = users.find((x) => x.userId === r.user_id);
         if (!u) return false;
+
         if (me.role === "admin") return true;
         if (me.role === "manager") return canAccessUser(me, u);
         if (me.role === "teacher") return u.role === "user" && canAccessUser(me, u);
         return false;
       });
-    reqs.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-    return reqs;
-  }, [users, me.role]) || [];
 
-  const [reqOpen, setReqOpen] = useState(false);
-  const [selectedReq, setSelectedReq] = useState(null);
-  const [reqComment, setReqComment] = useState("");
+      setRequests(filtered);
+    } catch (e) {
+      toast.ng(String(e?.message ?? e));
+    } finally {
+      setLoading(false);
+    }
+  }
 
-  const requester = useMemo(() => selectedReq ? (users.find((u) => u.userId === selectedReq.userId) || null) : null, [selectedReq, users]);
-  const selectedBook = useMemo(() => selectedReq ? (books.find((b) => b.bookId === selectedReq.bookId) || null) : null, [selectedReq, books]);
+  // 初回ロード + usersが揃ったら再ロード
+  useEffect(() => {
+    if (!me?.role) return;
+    if (users.length === 0) return;
+    loadRequests();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [users.length, me.role]);
 
-  const openReq = (r) => { setSelectedReq(r); setReqComment(""); setReqOpen(true); };
+  // Realtime購読（申請が来たら管理画面に即反映）
+  useEffect(() => {
+    if (!me?.role) return;
+
+    const ch = supabase
+      .channel("book-requests-admin")
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "book_requests" },
+        () => loadRequests()
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "book_requests" },
+        () => loadRequests()
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(ch);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [me.role, users.length]);
+
+  const requester = useMemo(() => {
+    if (!selectedReq) return null;
+    return users.find((u) => u.userId === selectedReq.user_id) ?? null;
+  }, [selectedReq, users]);
+
+  const selectedBook = useMemo(() => {
+    if (!selectedReq) return null;
+    return books.find((b) => b.bookId === selectedReq.book_id) ?? null;
+  }, [selectedReq, books]);
+
+  const openReq = (r) => {
+    setSelectedReq(r);
+    setReqComment("");
+    setReqOpen(true);
+  };
 
   const doApprove = async () => {
+    if (!selectedReq) return;
+
     try {
-      await approveBookRequest({ reqId: selectedReq.id, actorUserId: me.userId, comment: reqComment });
+      // ① まず既存ロジック（Dexie側の承認処理）も回す（権限・ログ等を使っている前提）
+      await approveBookRequest({
+        reqId: selectedReq.id,
+        actorUserId: me.userId,
+        comment: reqComment,
+      });
+
+      // ② Supabase側も status 更新（管理一覧から消える）
+      const { error } = await supabase
+        .from("book_requests")
+        .update({
+          status: "approved",
+          decided_by: me.userId,
+          decided_at: new Date().toISOString(),
+          comment: reqComment ?? "",
+        })
+        .eq("id", selectedReq.id);
+
+      if (error) toast.warn(`Supabase更新警告: ${error.message}`);
+
       toast.ok("承認しました");
       setReqOpen(false);
       setSelectedReq(null);
-    } catch (e) { toast.ng(String(e?.message || e)); }
+      await loadRequests();
+    } catch (e) {
+      toast.ng(String(e?.message ?? e));
+    }
   };
 
   const doReject = async () => {
-    if (!reqComment.trim()) { toast.warn("拒否コメントを入力してください"); return; }
+    if (!selectedReq) return;
+    if (!reqComment.trim()) {
+      toast.warn("拒否コメントを入力してください");
+      return;
+    }
+
     try {
-      await rejectBookRequest({ reqId: selectedReq.id, actorUserId: me.userId, comment: reqComment.trim() });
+      // ① 既存ロジック（Dexie側）
+      await rejectBookRequest({
+        reqId: selectedReq.id,
+        actorUserId: me.userId,
+        comment: reqComment.trim(),
+      });
+
+      // ② Supabase側も status 更新
+      const { error } = await supabase
+        .from("book_requests")
+        .update({
+          status: "rejected",
+          decided_by: me.userId,
+          decided_at: new Date().toISOString(),
+          comment: reqComment.trim(),
+        })
+        .eq("id", selectedReq.id);
+
+      if (error) toast.warn(`Supabase更新警告: ${error.message}`);
+
       toast.warn("却下しました");
       setReqOpen(false);
       setSelectedReq(null);
-    } catch (e) { toast.ng(String(e?.message || e)); }
+      await loadRequests();
+    } catch (e) {
+      toast.ng(String(e?.message ?? e));
+    }
   };
 
   return (
@@ -73,15 +205,30 @@ export default function AdminPage() {
         <div className="muted">参考書申請（承認待ち）</div>
         <div className="hr" />
 
+        <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+          <div className="muted">
+            {loading ? "読み込み中…" : `承認待ち: ${requests.length}件`}
+          </div>
+          <button className="btn" onClick={loadRequests} disabled={loading}>
+            更新
+          </button>
+        </div>
+
+        <div className="hr" />
+
         {requests.length === 0 ? (
           <div className="muted">申請はありません</div>
         ) : (
           <div className="grid" style={{ gap: 10 }}>
             {requests.map((r) => (
               <button key={r.id} className="btn" onClick={() => openReq(r)} style={{ textAlign: "left" }}>
-                <div style={{ fontWeight: 950 }}>{bookTitle.get(r.bookId) || "（参考書）"}</div>
-                <div className="muted">申請者: {r.userId}</div>
-                <div className="muted">{new Date(r.createdAt).toLocaleString()}</div>
+                <div style={{ fontWeight: 950 }}>
+                  {bookTitle.get(r.book_id) ?? "（参考書）"}
+                </div>
+                <div className="muted">申請者: {r.user_id}</div>
+                <div className="muted">
+                  {r.created_at ? new Date(r.created_at).toLocaleString() : ""}
+                </div>
               </button>
             ))}
           </div>
@@ -109,8 +256,10 @@ export default function AdminPage() {
         {!selectedReq ? null : (
           <div className="grid" style={{ gap: 12 }}>
             <div className="card soft">
-              <div style={{ fontWeight: 950 }}>{selectedBook?.title || "（参考書）"}</div>
-              <div className="muted">申請者: {selectedReq.userId}（{ROLE_LABEL[requester?.role] || "—"}）</div>
+              <div style={{ fontWeight: 950 }}>{selectedBook?.title ?? "（参考書）"}</div>
+              <div className="muted">
+                申請者: {selectedReq.user_id}（{ROLE_LABEL[requester?.role] ?? "—"}）
+              </div>
             </div>
 
             <div className="grid grid-2">
@@ -123,19 +272,23 @@ export default function AdminPage() {
                     alt="例画像"
                     style={{ width: "100%", borderRadius: 12, border: "1px solid #e5e7eb" }}
                   />
-                ) : <div className="muted">例画像なし</div>}
+                ) : (
+                  <div className="muted">例画像なし</div>
+                )}
               </div>
 
               <div className="card soft">
                 <div style={{ fontWeight: 950 }}>提出画像</div>
                 <div className="hr" />
-                {selectedReq.photoDataUrl ? (
+                {selectedReq.photo_data_url ? (
                   <img
-                    src={selectedReq.photoDataUrl}
+                    src={selectedReq.photo_data_url}
                     alt="提出画像"
                     style={{ width: "100%", borderRadius: 12, border: "1px solid #e5e7eb" }}
                   />
-                ) : <div className="badge badge-ng">画像なし</div>}
+                ) : (
+                  <div className="badge badge-ng">画像なし</div>
+                )}
               </div>
             </div>
 
@@ -152,7 +305,11 @@ export default function AdminPage() {
               <div style={{ fontWeight: 950 }}>コメント</div>
               <div className="muted">拒否時は必須。許可時は任意（通知にも載ります）</div>
               <div className="hr" />
-              <textarea value={reqComment} onChange={(e) => setReqComment(e.target.value)} placeholder="理由/補足を入力…" />
+              <textarea
+                value={reqComment}
+                onChange={(e) => setReqComment(e.target.value)}
+                placeholder="理由/補足を入力…"
+              />
             </div>
           </div>
         )}
@@ -160,4 +317,3 @@ export default function AdminPage() {
     </div>
   );
 }
-

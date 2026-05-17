@@ -57,7 +57,6 @@ export async function initDbIfEmpty() {
   const n = await db.users.count();
   if (n > 0) return;
 
-  // seed: users/emailは空欄可
   await db.users.bulkAdd(seed.users.map((u) => ({ ...u, email: u.email ?? "" })));
   await db.books.bulkAdd(seed.books.map((b) => ({ ...b })));
   await db.chapters.bulkAdd(seed.chapters.map((c) => ({ ...c })));
@@ -77,16 +76,13 @@ export async function initDbIfEmpty() {
     }))
   );
 
-  // 初期：管理者に全参考書アクセス
   const allBooks = seed.books.map((b) => b.bookId);
   await db.userBookAccess.bulkAdd(allBooks.map((bookId) => ({ userId: "kanri", bookId, grantedAt: Date.now() })));
 
-  // 設定初期化
   for (const u of seed.users) {
     await db.userSettings.put({ userId: u.userId, ...DEFAULT_USER_SETTINGS });
   }
 
-  // 通知テスト（任意）
   await db.notifications.add({
     userId: "seito",
     type: "info",
@@ -100,7 +96,6 @@ export async function initDbIfEmpty() {
 export async function getUserSettings(userId) {
   const row = await db.userSettings.get(userId);
   if (row) return row;
-
   const init = { userId, ...DEFAULT_USER_SETTINGS };
   await db.userSettings.put(init);
   return init;
@@ -168,11 +163,7 @@ function safeUuid() {
 }
 
 /**
- * ✅ ここが今回のポイント：
- * 申請を Dexie に保存するだけでなく、Supabase の book_requests にも保存する
- *
- * Supabase側に book_requests テーブルが必要：
- * - id (uuid) / user_id (text) / book_id (text) / status (text) / created_at (timestamptz) など
+ * 申請：Dexieに保存 + Supabase(book_requests)に保存
  */
 export async function createBookRequest({ userId, bookId, photoDataUrl }) {
   const id = safeUuid();
@@ -190,33 +181,197 @@ export async function createBookRequest({ userId, bookId, photoDataUrl }) {
     decidedAt: null,
   };
 
-  // 1) まずローカルに保存（オフラインでも操作が成立する）
   await db.bookRequests.put(row);
 
-  // 2) オンラインなら Supabase にも保存（管理タブで見えるようになる）
   try {
     await supabase.from("book_requests").insert([
       {
-        id, // uuid型の列ならSupabase側でuuidに合わせて。textならそのままでもOK
+        id,
         user_id: userId,
         book_id: bookId,
         status: "pending",
+        created_at: new Date().toISOString(),
         photo_data_url: photoDataUrl ?? null,
       },
     ]);
   } catch (e) {
     console.warn("[book_requests] supabase insert failed (offline?)", e);
-    // ここでは落とさない：後で「同期キュー」に積む設計に拡張可能
   }
 
   return row;
 }
 
 /**
- * notifyBookRequest / approve/reject は次段階で Supabase 連動させる
- * （まずは申請が管理画面に見えることを最短で達成するため、ここではローカル通知のまま）
+ * ✅ 承認：Dexieの付与 + Supabase(book_requests)更新 + Supabase(notifications)にINSERT（リアルタイム通知）
  */
+export async function approveBookRequest({ reqId, actorUserId, comment }) {
+  const req = await db.bookRequests.get(reqId);
+  if (!req) return null;
 
+  const actor = await db.users.get(actorUserId);
+  const requester = await db.users.get(req.userId);
+  if (!actor || !requester) return null;
+
+  // teacher申請は manager/admin のみ
+  if (requester.role === "teacher" && !(actor.role === "manager" || actor.role === "admin")) {
+    throw new Error("権限がありません（講師申請は教務/管理者のみ許可可）");
+  }
+
+  await db.bookRequests.update(reqId, {
+    status: "approved",
+    comment: comment ?? "",
+    decidedAt: Date.now(),
+    decidedBy: actorUserId,
+  });
+
+  await db.userBookAccess.put({ userId: req.userId, bookId: req.bookId, grantedAt: Date.now() });
+
+  await db.bookGrantLogs.add({
+    targetUserId: req.userId,
+    adminUserId: actorUserId,
+    bookId: req.bookId,
+    action: "approve",
+    comment: comment ?? "",
+    createdAt: Date.now(),
+  });
+
+  const book = await db.books.get(req.bookId);
+  const bookTitle = book?.title ?? "（参考書）";
+
+  const trimmed = (comment ?? "").trim();
+  const content = trimmed
+    ? `参考書申請「${bookTitle}」が承認されました。\nコメント: ${trimmed}`
+    : `参考書申請「${bookTitle}」が承認されました。`;
+
+  // ローカル通知（従来）
+  await db.notifications.add({
+    userId: req.userId,
+    type: "book",
+    content,
+    isRead: 0,
+    createdAt: Date.now(),
+    metaJson: "",
+  });
+
+  // ✅ Supabase通知（これが「リアルタイムで飛ぶ」本体）
+  try {
+    await supabase.from("notifications").insert([
+      {
+        user_id: req.userId,
+        type: "book",
+        content,
+        is_read: false,
+        created_at: new Date().toISOString(),
+      },
+    ]);
+  } catch (e) {
+    console.warn("[notifications] supabase insert failed", e);
+  }
+
+  // （任意）Supabase側の申請ステータスも更新して管理画面の一覧から消す
+  try {
+    await supabase
+      .from("book_requests")
+      .update({
+        status: "approved",
+        decided_by: actorUserId,
+        decided_at: new Date().toISOString(),
+        comment: trimmed,
+      })
+      .eq("id", reqId);
+  } catch (e) {
+    // 失敗しても承認自体は成立しているので落とさない
+    console.warn("[book_requests] supabase update failed", e);
+  }
+
+  return req;
+}
+
+/**
+ * ✅ 拒否：Dexie更新 + Supabase(book_requests)更新 + Supabase(notifications)にINSERT（リアルタイム通知）
+ */
+export async function rejectBookRequest({ reqId, actorUserId, comment }) {
+  const req = await db.bookRequests.get(reqId);
+  if (!req) return null;
+
+  if (!comment || !comment.trim()) throw new Error("拒否コメントが必須です");
+
+  await db.bookRequests.update(reqId, {
+    status: "rejected",
+    comment: comment.trim(),
+    decidedAt: Date.now(),
+    decidedBy: actorUserId,
+  });
+
+  await db.bookGrantLogs.add({
+    targetUserId: req.userId,
+    adminUserId: actorUserId,
+    bookId: req.bookId,
+    action: "reject",
+    comment: comment.trim(),
+    createdAt: Date.now(),
+  });
+
+  const book = await db.books.get(req.bookId);
+  const bookTitle = book?.title ?? "（参考書）";
+
+  const content = `参考書申請「${bookTitle}」が拒否されました。\n理由: ${comment.trim()}`;
+
+  // ローカル通知
+  await db.notifications.add({
+    userId: req.userId,
+    type: "book",
+    content,
+    isRead: 0,
+    createdAt: Date.now(),
+    metaJson: "",
+  });
+
+  // ✅ Supabase通知（リアルタイム）
+  try {
+    await supabase.from("notifications").insert([
+      {
+        user_id: req.userId,
+        type: "book",
+        content,
+        is_read: false,
+        created_at: new Date().toISOString(),
+      },
+    ]);
+  } catch (e) {
+    console.warn("[notifications] supabase insert failed", e);
+  }
+
+  // （任意）Supabase側の申請ステータスも更新
+  try {
+    await supabase
+      .from("book_requests")
+      .update({
+        status: "rejected",
+        decided_by: actorUserId,
+        decided_at: new Date().toISOString(),
+        comment: comment.trim(),
+      })
+      .eq("id", reqId);
+  } catch (e) {
+    console.warn("[book_requests] supabase update failed", e);
+  }
+
+  return req;
+}
+
+export async function hideRejectedRequest({ reqId, actorUserId }) {
+  const req = await db.bookRequests.get(reqId);
+  if (!req) return null;
+  if (req.status !== "rejected") return null;
+  if (req.userId !== actorUserId) return null;
+  await db.bookRequests.update(reqId, { isHidden: 1 });
+  return req;
+}
+
+/**
+ * 勉強時間算出（仕様準拠）
+ */
 export async function getStudyTimeMsByDate(userId, dateKey) {
   const start = new Date(dateKey + "T00:00:00").getTime();
   const end = start + 86400000;
@@ -228,7 +383,6 @@ export async function getStudyTimeMsByDate(userId, dateKey) {
     .toArray();
 
   if (rows.length < 2) return 0;
-
   rows.sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0));
 
   const CAP = 120000;
