@@ -76,13 +76,16 @@ export async function initDbIfEmpty() {
     }))
   );
 
+  // 初期：管理者に全参考書アクセス
   const allBooks = seed.books.map((b) => b.bookId);
   await db.userBookAccess.bulkAdd(allBooks.map((bookId) => ({ userId: "kanri", bookId, grantedAt: Date.now() })));
 
+  // 設定初期化
   for (const u of seed.users) {
     await db.userSettings.put({ userId: u.userId, ...DEFAULT_USER_SETTINGS });
   }
 
+  // 通知テスト（任意）
   await db.notifications.add({
     userId: "seito",
     type: "info",
@@ -96,6 +99,7 @@ export async function initDbIfEmpty() {
 export async function getUserSettings(userId) {
   const row = await db.userSettings.get(userId);
   if (row) return row;
+
   const init = { userId, ...DEFAULT_USER_SETTINGS };
   await db.userSettings.put(init);
   return init;
@@ -164,6 +168,7 @@ function safeUuid() {
 
 /**
  * 申請：Dexieに保存 + Supabase(book_requests)に保存
+ * （Supabase側に book_requests テーブルが必要）
  */
 export async function createBookRequest({ userId, bookId, photoDataUrl }) {
   const id = safeUuid();
@@ -181,8 +186,10 @@ export async function createBookRequest({ userId, bookId, photoDataUrl }) {
     decidedAt: null,
   };
 
+  // 1) ローカルに保存（オフラインでも成立）
   await db.bookRequests.put(row);
 
+  // 2) Supabaseに保存（管理タブで見える）
   try {
     await supabase.from("book_requests").insert([
       {
@@ -202,7 +209,7 @@ export async function createBookRequest({ userId, bookId, photoDataUrl }) {
 }
 
 /**
- * ✅ 承認：Dexieの付与 + Supabase(book_requests)更新 + Supabase(notifications)にINSERT（リアルタイム通知）
+ * ✅ 承認：Dexie処理 + Supabase(book_requests)更新 + Supabase(notifications)にINSERT（リアルタイム通知）
  */
 export async function approveBookRequest({ reqId, actorUserId, comment }) {
   const req = await db.bookRequests.get(reqId);
@@ -243,7 +250,7 @@ export async function approveBookRequest({ reqId, actorUserId, comment }) {
     ? `参考書申請「${bookTitle}」が承認されました。\nコメント: ${trimmed}`
     : `参考書申請「${bookTitle}」が承認されました。`;
 
-  // ローカル通知（従来）
+  // ローカル通知
   await db.notifications.add({
     userId: req.userId,
     type: "book",
@@ -253,7 +260,7 @@ export async function approveBookRequest({ reqId, actorUserId, comment }) {
     metaJson: "",
   });
 
-  // ✅ Supabase通知（これが「リアルタイムで飛ぶ」本体）
+  // ✅ Supabase通知（リアルタイムで飛ぶ）
   try {
     await supabase.from("notifications").insert([
       {
@@ -268,7 +275,7 @@ export async function approveBookRequest({ reqId, actorUserId, comment }) {
     console.warn("[notifications] supabase insert failed", e);
   }
 
-  // （任意）Supabase側の申請ステータスも更新して管理画面の一覧から消す
+  // （任意）Supabase側の申請ステータスも更新
   try {
     await supabase
       .from("book_requests")
@@ -280,7 +287,6 @@ export async function approveBookRequest({ reqId, actorUserId, comment }) {
       })
       .eq("id", reqId);
   } catch (e) {
-    // 失敗しても承認自体は成立しているので落とさない
     console.warn("[book_requests] supabase update failed", e);
   }
 
@@ -443,3 +449,4 @@ export async function flushAnswerLogs() {
   logBuffer = [];
   await db.answerLogs.bulkAdd(batch.map((l) => ({ ...l, createdAt: l.createdAt ?? Date.now() })));
 }
+
