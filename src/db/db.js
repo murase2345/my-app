@@ -449,4 +449,3 @@ export async function flushAnswerLogs() {
   logBuffer = [];
   await db.answerLogs.bulkAdd(batch.map((l) => ({ ...l, createdAt: l.createdAt ?? Date.now() })));
 }
-
